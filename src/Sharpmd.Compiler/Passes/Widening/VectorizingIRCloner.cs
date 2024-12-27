@@ -1,114 +1,43 @@
 namespace Sharpmd.Compiler;
 
-using System.Collections.Immutable;
 using System.Diagnostics;
 
-using DistIL;
 using DistIL.Analysis;
 using DistIL.AsmIO;
 using DistIL.IR;
 using DistIL.IR.Utils;
 using DistIL.Passes;
-using DistIL.Util;
-
-using MethodAttrs = System.Reflection.MethodAttributes;
-
-public class VectorWideningPass {
-    internal Compilation _comp;
-    internal TypeDef _containerType;
-    internal int _targetWidth;
-
-    private Dictionary<TypeDesc, VectorType> _vectorTypeCache = new();
-    public Dictionary<MethodBody, MethodBody> VectorizedMethods = new();
-    private ArrayStack<MethodBody> _worklist = new();
-    
-    public VectorWideningPass(Compilation comp, int targetWidth) {
-        _comp = comp;
-        _containerType = comp.Module.CreateType(null, $"<>_SpmdGen_{comp.Module.TypeDefs.Count}_{targetWidth}");
-        _targetWidth = targetWidth;
-    }
-
-    public void AddEntryPoint(MethodBody method) {
-        _worklist.Push(method);
-    }
-    public void Process() {
-        while (!_worklist.IsEmpty) {
-            ProcessMethod(_worklist.Pop());
-        }
-    }
-
-    private void ProcessMethod(MethodBody srcMethod) {
-        var destMethod = GetVectorizedMethod(srcMethod)!;
-        var ctx = new MethodTransformContext(_comp, srcMethod);
-        var cloner = new VectorizingIRCloner(this, ctx, destMethod, default);
-
-        for (int i = 0; i < srcMethod.Args.Length; i++) {
-            cloner.AddMapping(srcMethod.Args[i], destMethod.Args[i]);
-        }
-
-        cloner.CloneWide();
-    }
-
-    internal MethodBody? GetVectorizedMethod(MethodBody srcMethod) {
-        var srcDef = srcMethod.Definition;
-
-        if (srcDef.Module != _comp.Module) {
-            return null;
-        }
-        if (VectorizedMethods.TryGetValue(srcMethod, out var vectorBody)) {
-            return vectorBody;
-        }
-
-        var newParams = ImmutableArray.CreateBuilder<ParamDef>();
-
-        foreach (var arg in srcMethod.Args) {
-            var type = arg.Param.Sig;
-
-            if (!UniformValueAnalysis.IsUniform(srcDef, arg.Param)) {
-                type = GetVectorType(arg.ResultType);
-            }
-            newParams.Add(new ParamDef(type, arg.Param.Name, arg.Param.Attribs));
-        }
-        var retType = srcDef.ReturnType;
-    
-        if (retType != PrimType.Void && !UniformValueAnalysis.IsUniform(srcDef, srcDef.ReturnParam)) {
-            retType = GetVectorType(retType);
-        }
-
-        var vectorDef = _containerType.CreateMethod(srcDef.Name, retType, newParams.ToImmutable(), MethodAttrs.Public | MethodAttrs.Static | MethodAttrs.HideBySig);
-
-        vectorDef.Body = new MethodBody(vectorDef);
-        VectorizedMethods[srcMethod] = vectorDef.Body;
-
-        return vectorDef.Body;
-    }
-
-    internal VectorType GetVectorType(TypeDesc laneType) {
-        return _vectorTypeCache.GetOrAddRef(laneType) ??= new(laneType, _targetWidth);
-    }
-}
 
 class VectorizingIRCloner : IRCloner {
     readonly VectorWideningPass _pass;
+    readonly MethodBody _srcMethod;
     readonly UniformValueAnalysis _uniformity;
-    readonly MaskGenerator _maskGen;
     readonly IRBuilder _builder;
+    readonly Dictionary<BasicBlock, VectorIntrinsic.ExecMask> _blockMasks = new();
 
-    Value? _currExecMask;
+    Value? _currExecMask = null;
 
     public VectorizingIRCloner(VectorWideningPass pass, MethodTransformContext ctx, MethodBody destMethod, GenericContext genCtx) : base(destMethod, genCtx) {
         _pass = pass;
-        _uniformity = new UniformValueAnalysis(ctx.Method, pass._comp.GetAnalysis<GlobalFunctionEffects>());
-        _maskGen = new MaskGenerator(ctx.Method, destMethod, _uniformity, ctx.GetAnalysis<LoopAnalysis>());
+        _srcMethod = ctx.Method;
+        _uniformity = ctx.GetAnalysis<UniformValueAnalysis>();
 
         _builder = new IRBuilder(default(BasicBlock)!, InsertionDir.After);
     }
 
     public void CloneWide() {
-        var srcBlocks = _maskGen.GetSortedBlocks();
+        foreach (var block in _srcMethod) {
+            var destBlock = _destMethod.CreateBlock();
+            AddMapping(block, destBlock);
 
-        foreach (var block in srcBlocks) {
-            var destBlock = _maskGen.GetFlattenedBlock(block);
+            if (_uniformity.IsDivergent(block)) {
+                _blockMasks[destBlock] = new VectorIntrinsic.ExecMask(_pass.GetVectorType(PrimType.Bool), destBlock);
+            }
+        }
+
+        foreach (var block in _srcMethod) {
+            var destBlock = GetMapping(block);
+            _currExecMask = _blockMasks.GetValueOrDefault(destBlock);
 
             for (var inst = block.First; inst != block.Last; inst = inst.Next!) {
                 _builder.SetPosition(destBlock, InsertionDir.After);
@@ -118,6 +47,16 @@ class VectorizingIRCloner : IRCloner {
                     destBlock.InsertLast(newInst);
                 }
             }
+            
+            var clonedBranch = WidenBranch(block.Last);
+            if (clonedBranch is Instruction { Block: null } newBranch) {
+                destBlock.InsertLast(newBranch);
+            }
+        }
+        // TODO: proper masking
+        foreach(var (block, mask) in _blockMasks) {
+            _builder.SetPosition(block.FirstNonHeader, InsertionDir.Before);
+            mask.ReplaceUses(EmitSplat(PrimType.Bool, ConstInt.CreateI(1)));
         }
     }
 
@@ -129,23 +68,30 @@ class VectorizingIRCloner : IRCloner {
         }
 
         if (inst is PhiInst phi) {
-            if (_maskGen.IsSelectionPhi(phi)) {
-                return ConvertPhiToSelect(phi);
-            } else {
-                Debug.Assert(_builder.Block.FirstNonHeader == null); // TODO: can csels and phis be mixed?
-                return base.CreateClone(phi);
-            }
+            return WidenPhi(phi);
         }
 
         if (inst is BinaryInst bin) {
-            return _builder.Emit(new VectorIntrinsic.Binary(bin.Op, _pass.GetVectorType(bin.ResultType), Remap(bin.Left), Remap(bin.Right)));
+            Debug.Assert(bin.Left.ResultType.Kind.GetStorageType() == bin.Right.ResultType.Kind.GetStorageType());
+            var type = _pass.GetVectorType(bin.ResultType);
+            var left = RemapCoerced(type, bin.Left);
+            var right = RemapCoerced(type, bin.Right);
+            return _builder.CreateBin(bin.Op, left, right);
         }
         if (inst is CompareInst cmp) {
             Debug.Assert(cmp.Left.ResultType.Kind.GetStorageType() == cmp.Right.ResultType.Kind.GetStorageType());
-            return _builder.Emit(new VectorIntrinsic.Compare(cmp.Op, _pass.GetVectorType(cmp.Left.ResultType), Remap(cmp.Left), Remap(cmp.Right)));
+            var type = _pass.GetVectorType(cmp.Left.ResultType);
+            var left = RemapCoerced(type, cmp.Left);
+            var right = RemapCoerced(type, cmp.Right);
+            return _builder.CreateCmp(cmp.Op, left, right);
         }
-        if (inst is LoadInst load && EmitGather((TypeDesc)Remap(load.ElemType), Remap(load.Address)) is { } gatherInst) {
-            return gatherInst;
+        if (inst is LoadInst load) {
+            var vecType = _pass.GetVectorType(load.ElemType);
+            // return _builder.Emit(new VectorIntrinsic.MemGather(vecType, Remap(load.Address), _currExecMask));
+        }
+        if (inst is StoreInst store) {
+            var vecType = _pass.GetVectorType(store.ElemType);
+            // return _builder.Emit(new VectorIntrinsic.MemScatter(vecType, Remap(store.Address), Remap(store.Value), _currExecMask));
         }
         if (inst is ArrayAddrInst arrd && _uniformity.IsUniform(arrd.Array) && arrd.ElemType.IsValueType) {
             return WidenUniformArrayAddr(arrd);
@@ -160,16 +106,52 @@ class VectorizingIRCloner : IRCloner {
         // TODO: group multiple instructions and generate scalarization loop?
         return Scalarize(inst);
     }
+    protected override TypeDesc GetRemappedType(Instruction inst) {
+        var type = base.GetRemappedType(inst);
 
-    private Value ConvertPhiToSelect(PhiInst phi) {
-        var result = Remap(phi.GetValue(0));
-        var type = _pass.GetVectorType((TypeDesc)Remap(phi.ResultType));
-
-        for (int i = 1; i < phi.NumArgs; i++) {
-            var (pred, val) = phi.GetArg(i);
-            result = _builder.CreateSelect(_maskGen.GetBlockMask(pred), Remap(val), result, type);
+        if (!_uniformity.IsUniform(inst)) {
+            return _pass.GetVectorType(type);
         }
-        return result;
+        return type;
+    }
+
+    private Value RemapCoerced(VectorType type, Value value) {
+        if (value is Const cns) {
+            return EmitSplat(type.ElemType, cns);
+        }
+        var mapping = Remap(value);
+        Debug.Assert(mapping.ResultType == type);
+        return mapping;
+    }
+
+    private Value WidenBranch(Instruction inst) {
+        if (inst is BranchInst br) {
+            if (!br.IsConditional || _uniformity.IsUniform(br.Cond)) {
+                return base.CreateClone(inst);
+            }
+
+            var mask = Remap(br.Cond);
+            return new BranchInst(EmitCmpMask(MaskCompareOp.AnySet, mask), GetMapping(br.Then), GetMapping(br.Else));
+        }
+        if (inst is ReturnInst) {
+            return base.CreateClone(inst);
+        }
+        throw new NotImplementedException();
+    }
+
+    private Value WidenPhi(PhiInst phi) {
+        var type = _pass.GetVectorType((TypeDesc)Remap(phi.ResultType));
+        var args = new Value[phi.NumArgs * 2];
+
+        for (int i = 0; i < phi.NumArgs; i++) {
+            var (pred, val) = phi.GetArg(i);
+            pred = GetMapping(pred);
+
+            _builder.SetPosition(pred, InsertionDir.BeforeLast);
+            args[i * 2 + 0] = pred;
+            args[i * 2 + 1] = RemapCoerced(type, val);
+        }
+        return new PhiInst(type, args);
     }
 
     private Value Scalarize(Instruction inst) {
@@ -198,25 +180,21 @@ class VectorizingIRCloner : IRCloner {
         return ConstNull.Create(); // dummy
     }
 
-    private Value? EmitGather(TypeDesc elemType, Value address) {
-        return null;
-    }
-
     private Value WidenUniformArrayAddr(ArrayAddrInst inst) {
         var array = Remap(inst.Array);
         var index = Remap(inst.Index);
         
         if (!inst.InBounds) {
-            EmitBoundsCheck(index, _builder.CreateArrayLen(array));
+            EmitBoundsCheck(index, _builder.CreateConvert(_builder.CreateArrayLen(array), PrimType.UInt32));
         }
         var basePtr = LoopStrengthReduction.CreateGetDataPtrRange(_builder, array, getCount: false).BasePtr;
         return _builder.Emit(new VectorIntrinsic.OffsetUniformPtr(_pass.GetVectorType(inst.ResultType), basePtr, index));
     }
 
     private void EmitBoundsCheck(Value index, Value length) {
-        var mask = _builder.Emit(new VectorIntrinsic.Compare(CompareOp.Ult, _pass.GetVectorType(PrimType.UInt32), index, length));
-        var cond = _builder.Emit(new CompareInst(CompareOp.Ne, EmitMoveMask(mask), ConstInt.CreateL(0)));
-        _builder.CreateCall(_pass._comp.Resolver.Import(typeof(SimdOps)).FindMethod("ConditionalThrow_IndexOutOfRange"), cond);
+        var mask = _builder.CreateUlt(index, EmitSplat(PrimType.UInt32, length));
+        var throwHelper = _pass._comp.Resolver.Import(typeof(SimdOps)).FindMethod("ConditionalThrow_IndexOutOfRange");
+        _builder.CreateCall(throwHelper, EmitCmpMask(MaskCompareOp.AllSet, mask));
     }
     
     private Value WidenConvert(TypeKind srcType, TypeKind dstType, Value value) {
@@ -254,7 +232,10 @@ class VectorizingIRCloner : IRCloner {
         return _builder.Emit(new VectorIntrinsic.GetLane(value, laneIdx));
     }
 
-    private Value EmitMoveMask(Value vector) {
-        return _builder.Emit(new VectorIntrinsic.GetMask(vector));
+    private Value EmitCmpMask(MaskCompareOp op, Value mask) {
+        if (_currExecMask != null) {
+            mask = _builder.CreateAnd(mask, _currExecMask);
+        }
+        return _builder.Emit(new VectorIntrinsic.MaskCompare(op, mask));
     }
 }

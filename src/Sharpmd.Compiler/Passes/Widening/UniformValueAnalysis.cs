@@ -1,5 +1,7 @@
 namespace Sharpmd.Compiler;
 
+using System.Diagnostics;
+
 using DistIL.Analysis;
 using DistIL.AsmIO;
 using DistIL.IR;
@@ -62,6 +64,8 @@ public class UniformValueAnalysis : IMethodAnalysis, IPrintDecorator {
     }
 
     private ValueUniformityKind ComputeUniformity(Instruction inst) {
+        Debug.Assert(inst.Block.Method == _method);
+        
         if (inst is CallInst call) {
             var funcEffects = _funcInfo.GetEffects(call.Method);
             return funcEffects.MayOnlyThrowOrReadMem ? CheckAllValuesUniform(call.Args) : ValueUniformityKind.Varying;

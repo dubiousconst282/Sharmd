@@ -3,7 +3,6 @@ namespace Sharpmd.Compiler;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 
 using DistIL;
 using DistIL.AsmIO;
@@ -15,11 +14,13 @@ using TypeAttrs = System.Reflection.TypeAttributes;
 using FieldAttrs = System.Reflection.FieldAttributes;
 using DistIL.Passes;
 
+/// <summary> Lower vectorized IR to concrete <c>System.Runtime.Intrinsics</c> vector types. </summary>
 public class VectorLoweringPass : IMethodPass {
     readonly Compilation _comp;
 
     readonly Dictionary<VectorType, VectorPack> _vectorPackCache = new();
     readonly Dictionary<Value, TypeDesc> _sourceTypes = new();
+    readonly PrimType _naturalMaskType = PrimType.Int32;
     
     readonly TypeDef t_SimdOps;
     
@@ -40,35 +41,22 @@ public class VectorLoweringPass : IMethodPass {
     public void Process(MethodBody method)
     {
         foreach (var inst in method.Instructions()) {
+            _builder.SetPosition(inst, InsertionDir.After);
+            Value? loweredPack;
+
             if (inst is VectorIntrinsic vinst) {
-                _builder.SetPosition(inst, InsertionDir.After);
-
-                var loweredPack = Lower(vinst);
-
-                if (loweredPack != null) {
-                    _sourceTypes[loweredPack] = inst.ResultType;
-                    inst.ReplaceUses(loweredPack);
-                }
-                inst.Remove();
+                loweredPack = LowerIntrinsic(vinst);
+            } else if (inst.ResultType is VectorType vtype) {
+                loweredPack = LowerWideInst(inst, vtype);
+            } else {
+                continue;
             }
-            else if (inst.ResultType is VectorType vtype) {
-                if (inst is PhiInst phi) {
-                    _sourceTypes[inst] = vtype;
-                    phi.SetResultType(GetRealType(vtype));
-                }
-                else if (inst is SelectInst csel) {
-                    _builder.SetPosition(inst, InsertionDir.After);
-                    
-                    var cond = CoerceOperand(vtype, csel.Cond);
-                    var ifTrue = CoerceOperand(vtype, csel.IfTrue);
-                    var ifFalse = CoerceOperand(vtype, csel.IfFalse);
-                    var loweredPack = EmitIntrinsic(vtype, "ConditionalSelect", [cond, ifTrue, ifFalse]);
-                    _sourceTypes[loweredPack] = vtype;
-                    inst.ReplaceWith(loweredPack);
-                }
-                else {
-                    throw new NotSupportedException();
-                }
+
+            if (loweredPack == null) {
+                inst.Remove();
+            } else if (loweredPack != inst) {
+                _sourceTypes.Add(loweredPack, inst.ResultType);
+                inst.ReplaceWith(loweredPack);
             }
         }
 
@@ -85,7 +73,41 @@ public class VectorLoweringPass : IMethodPass {
         _sourceTypes.Clear();
     }
 
-    protected Value? Lower(VectorIntrinsic inst) {
+    protected Value? LowerWideInst(Instruction inst, VectorType type)
+    {
+        if (inst is BinaryInst bin) {
+            return LowerBinary(bin.Op, bin.Left, bin.Right, type);
+        }
+        if (inst is CompareInst cmp) {
+            return LowerCompare(cmp.Op, cmp.Left, cmp.Right, type);
+        }
+        if (inst is SelectInst csel) {
+            var cond = CoerceOperand(type, csel.Cond);
+            var ifTrue = CoerceOperand(type, csel.IfTrue);
+            var ifFalse = CoerceOperand(type, csel.IfFalse);
+            return EmitIntrinsic(type, "ConditionalSelect", [cond, ifTrue, ifFalse]);
+        }
+        if (inst is PhiInst phi) {
+            _sourceTypes.Add(inst, type);
+            phi.SetResultType(GetRealType(type));
+
+            for (int i = 0; i < phi.NumArgs; i++) {
+                var (pred, val) = phi.GetArg(i);
+                _builder.SetPosition(pred, InsertionDir.BeforeLast);
+                
+                var coerced = CoerceOperand(type, val);
+                if (coerced != val) {
+                    phi.SetValue(i, coerced);
+                }
+            }
+            return phi;
+        }
+        throw new NotSupportedException();
+    }
+
+    protected Value? LowerIntrinsic(VectorIntrinsic inst) {
+        _builder.SetNextDebugLocation(inst.DebugLocation);
+
         switch (inst) {
             case VectorIntrinsic.Splat:
                 return EmitSplat((VectorType)inst.ResultType, inst.Args[0]);
@@ -94,17 +116,14 @@ public class VectorLoweringPass : IMethodPass {
                 // JIT knows how to collapse live ranges for Vector.Create() calls, so we don't need to worry about it.
                 var type = (VectorType)inst.ResultType;
                 return EmitIntrinsic(type, "Create", inst.Operands.ToArray(),
-                                     m => m.Params.Length == inst.Operands.Length && m.Params[0].Type == type.ElemType);
+                                     m => m.ParamSig.Count == inst.Operands.Length && m.ParamSig[0].Type == type.ElemType);
             }
-            
-            case VectorIntrinsic.Binary bin:
-                return EmitBinary(bin.Op, bin.Left, bin.Right, (VectorType)bin.ResultType);
-
-            case VectorIntrinsic.Compare cmp:
-                return EmitCompare(cmp.Op, cmp.Left, cmp.Right, (VectorType)cmp.ResultType);
 
             case VectorIntrinsic.GetMask:
-                return EmitMoveMask(inst.Args[0]);
+                return EmitMoveMask(inst.Args[0], true);
+
+            case VectorIntrinsic.MaskCompare cmp:
+                return EmitMaskCompare(cmp.Op, inst.Args[0]);
 
             case VectorIntrinsic.GetLane: {
                 var type = GetSourceVectorType(inst.Args[0]);
@@ -112,28 +131,28 @@ public class VectorLoweringPass : IMethodPass {
                 return EmitIntrinsic(type, "GetElement", inst.Operands.ToArray());
             }
 
-            case VectorIntrinsic.Convert conv:
-                return EmitConvert(conv.Op, conv.Args[0], (VectorType)conv.ResultType);
-
+            case VectorIntrinsic.Convert conv: {
+                var srcType = GetSourceVectorType(inst.Args[0]);
+                return LowerConvert(conv.Op, conv.Args[0], srcType, (VectorType)conv.ResultType);
+            }
             default:
                 throw new NotImplementedException();
         }
     }
 
-    private Value EmitBinary(BinaryOp op, Value a, Value b, VectorType type) {
+    private Value LowerBinary(BinaryOp op, Value a, Value b, VectorType type) {
         string intrinsicName = op switch {
-            BinaryOp.Add or BinaryOp.FAdd => "Add",
-            BinaryOp.Sub or BinaryOp.FSub => "Subtract",
-            BinaryOp.Mul or BinaryOp.FMul => "Multiply",
-            BinaryOp.SDiv or BinaryOp.UDiv or BinaryOp.FDiv => "Divide",
-            BinaryOp.And => "BitwiseAnd",
-            BinaryOp.Or => "BitwiseOr",
-            BinaryOp.Xor => "Xor",
+            BinaryOp.Add or BinaryOp.FAdd => "op_Addition",
+            BinaryOp.Sub or BinaryOp.FSub => "op_Subtraction",
+            BinaryOp.Mul or BinaryOp.FMul => "op_Multiply",
+            BinaryOp.SDiv or BinaryOp.UDiv or BinaryOp.FDiv => "op_Division",
+            BinaryOp.And => "op_BitwiseAnd",
+            BinaryOp.Or => "op_BitwiseOr",
+            BinaryOp.Xor => "op_ExclusiveOr",
             // BinaryOp.Shl => "ShiftLeft",
             // BinaryOp.Shra => "ShiftRightArithmetic",
             // BinaryOp.Shrl => "ShiftRightLogical",
         };
-
         TypeKind laneType = type.ElemType.Kind;
 
         if (op is BinaryOp.SDiv or BinaryOp.SRem) {
@@ -145,17 +164,30 @@ public class VectorLoweringPass : IMethodPass {
         else if (op is >= BinaryOp.FAdd and <= BinaryOp.FRem) {
             Debug.Assert(laneType.IsFloat());
         }
-        
-        if (type.ElemType.Kind != laneType) {
-            type = new VectorType(PrimType.GetFromKind(laneType), type.Width);
+        else if (laneType == TypeKind.Bool) {
+            Debug.Assert(op is BinaryOp.And or BinaryOp.Or or BinaryOp.Xor);
+            var elemTypeA = GetLoweredElemType(a).Kind;
+            var elemTypeB = GetLoweredElemType(b).Kind;
+
+            // Pick whichever type is smaller
+            laneType = elemTypeA.BitSize() < elemTypeB.BitSize() ? elemTypeA : elemTypeB;
         }
+
+        if (type.ElemType.Kind != laneType) {
+            type = VectorType.Create(PrimType.GetFromKind(laneType), type.Width);
+        }
+
         a = CoerceOperand(type, a);
         b = CoerceOperand(type, b);
         return EmitIntrinsic(type, intrinsicName, [a, b]);
     }
 
-    private Value EmitCompare(CompareOp op, Value a, Value b, VectorType type) {
-        TypeKind laneType = type.ElemType.Kind;
+    private Value LowerCompare(CompareOp op, Value a, Value b, VectorType maskType) {
+        TypeKind typeA = GetSourceElemType(a).Kind;
+        TypeKind typeB = GetSourceElemType(b).Kind;
+
+        Debug.Assert(typeA.GetStorageType() == typeB.GetStorageType());
+        TypeKind laneType = typeA;
 
         if (op.IsFloat()) {
             Debug.Assert(laneType.IsFloat());
@@ -169,33 +201,35 @@ public class VectorLoweringPass : IMethodPass {
             laneType = laneType.GetSigned();
         }
 
-        if (type.ElemType.Kind != laneType) {
-            type = new VectorType(PrimType.GetFromKind(laneType), type.Width);
-        }
+        Debug.Assert(maskType.ElemType.Kind == TypeKind.Bool);
+        var type = VectorType.Create(PrimType.GetFromKind(laneType), maskType.Width);
         a = CoerceOperand(type, a);
         b = CoerceOperand(type, b);
 
         string intrinsicName = op switch {
             CompareOp.Eq or CompareOp.Ne or CompareOp.FOeq or CompareOp.FUne => "Equals",
-            CompareOp.Slt or CompareOp.Ult or CompareOp.FOlt or CompareOp.FUlt => "LessThan",
-            CompareOp.Sgt or CompareOp.Ugt or CompareOp.FOgt or CompareOp.FUgt => "GreaterThan",
-            CompareOp.Sle or CompareOp.Ule or CompareOp.FOle or CompareOp.FUle => "LessThanOrEqual",
-            CompareOp.Sge or CompareOp.Uge or CompareOp.FOge or CompareOp.FUge => "GreaterThanOrEqual",
+            CompareOp.Slt or CompareOp.Ult or CompareOp.FOlt => "LessThan",
+            CompareOp.Sgt or CompareOp.Ugt or CompareOp.FOgt => "GreaterThan",
+            CompareOp.Sle or CompareOp.Ule or CompareOp.FOle => "LessThanOrEqual",
+            CompareOp.Sge or CompareOp.Uge or CompareOp.FOge => "GreaterThanOrEqual",
         };
         var result = EmitIntrinsic(type, intrinsicName, [a, b]);
 
-        if (op is CompareOp.Ne or CompareOp.FUne or CompareOp.FUlt or CompareOp.FUgt or CompareOp.FUle or CompareOp.FUge) {
-            result = EmitIntrinsic(type, "OnesComplement", [result]);
+        if (op is CompareOp.Ne or CompareOp.FUne) {
+            result = EmitIntrinsic(type, "op_OnesComplement", [result]);
         }
         return result;
     }
-    
-    private Value EmitConvert(ConvertOp op, Value value, VectorType destType) {
-        var srcType = GetSourceVectorType(value);
+
+    private Value LowerConvert(ConvertOp op, Value value, VectorType srcType, VectorType destType) {
         var srcKind = srcType.ElemType.Kind;
         var destKind = destType.ElemType.Kind;
 
-        if (op == ConvertOp.BitCast) {
+        if (srcKind == destKind) {
+            return value;
+        }
+
+        if (op == ConvertOp.BitCast || (srcKind.BitSize() == destKind.BitSize() && op is not (ConvertOp.I2F or ConvertOp.F2I))) {
             Debug.Assert(srcKind.BitSize() == destKind.BitSize());
             return EmitIntrinsic(srcType, "As" + destKind, [value]);
         }
@@ -215,29 +249,53 @@ public class VectorLoweringPass : IMethodPass {
 
     private Value CoerceOperand(VectorType destType, Value oper) {
         var type = _sourceTypes.GetValueOrDefault(oper, oper.ResultType);
+        Debug.Assert(type is VectorType);
 
         if (type is VectorType vtype && vtype != destType) {
-            return EmitConvert(ConvertOp.BitCast, oper, destType);
-        }
-        else if (IsScalarType(type)) {
-            return EmitSplat(destType, oper);
+            if (vtype.ElemType == PrimType.Bool) {
+                var loweredType = GetLoweredElemType(oper);
+                int srcSize = loweredType.Kind.BitSize();
+                var destSize = destType.ElemType.Kind.BitSize();
+                var op = srcSize > destSize ? ConvertOp.SignExt : ConvertOp.Trunc;
+                return LowerConvert(op, oper, VectorType.Create(loweredType, vtype.Width), destType);
+            }
+            return LowerConvert(ConvertOp.BitCast, oper, vtype, destType);
         }
         return oper;
     }
 
     private Value EmitSplat(VectorType type, Value value) {
-        return EmitIntrinsic(type, "Create", [value], m => m.Params.Length == 1 && m.Params[0].Type == type.ElemType);
-    }
-    private Value EmitMoveMask(Value vector) {
-        var mask = EmitIntrinsic(GetSourceVectorType(vector), "ExtractMostSignificantBits", [vector]);
+        var elemType = type.ElemType;
 
-        if (mask.ResultType != PrimType.UInt64) {
+        if (elemType == PrimType.Bool) {
+            elemType = _naturalMaskType;
+            value = _builder.CreateSelect(_builder.CreateNe(value, ConstInt.CreateI(0)), ConstInt.CreateI(-1), ConstInt.CreateI(0));
+        }
+        return EmitIntrinsic(type, "Create", [value], m => m.ParamSig.Count == 1 && m.ParamSig[0].Type == elemType);
+    }
+    private Value EmitMoveMask(Value vector, bool normalizeToU64) {
+        var mask = EmitIntrinsic(GetLoweredVectorType(vector), "ExtractMostSignificantBits", [vector]);
+
+        if (normalizeToU64 && mask.ResultType != PrimType.UInt64) {
             mask = _builder.CreateConvert(mask, PrimType.UInt64);
         }
         return mask;
     }
+
+    private Value EmitMaskCompare(MaskCompareOp op, Value vector) {
+        int width = GetSourceVectorType(vector).Width;
+        var mask = EmitMoveMask(vector, false);
+
+        var (targetOp, targetValue) = op switch {
+            MaskCompareOp.AnyZero => (CompareOp.Ne, 1L),
+            MaskCompareOp.AnySet  => (CompareOp.Ne, 0L),
+            MaskCompareOp.AllZero => (CompareOp.Eq, 0L),
+            MaskCompareOp.AllSet  => (CompareOp.Eq, 1L),
+        };
+        return _builder.CreateCmp(targetOp, mask, ConstInt.Create(mask.ResultType, -targetValue >>> (64 - width)));
+    }
     
-    private Value EmitIntrinsic(VectorType type, string name, Value[] args, Predicate<MethodDef>? filter = null) {
+    private Value EmitIntrinsic(VectorType type, string name, Value[] args, Predicate<MethodDesc>? filter = null) {
         var pack = GetVectorPack(type);
         
         var method = FindIntrinsic(pack.VecTypes![0], name, filter);
@@ -267,37 +325,51 @@ public class VectorLoweringPass : IMethodPass {
         return result;
     }
 
-    private MethodDesc FindIntrinsic(TypeDesc vectorType, string name, Predicate<MethodDef>? filter) {
-        var extClass = GetVectorExtClass(vectorType);
+    private MethodDesc FindIntrinsic(TypeDesc realType, string name, Predicate<MethodDesc>? filter) {
+        var extClass = name.StartsWith("op_") ? realType : GetVectorExtClass(realType);
 
         foreach (var method in extClass.Methods) {
             if (method.Name == name && method.IsStatic && (filter == null || filter.Invoke(method))) {
-                return method.IsGeneric ? method.GetSpec([vectorType.GenericParams[0]]) : method;
+                return method.IsGeneric ? method.GetSpec([realType.GenericParams[0]]) : method;
             }
         }
         throw new InvalidOperationException();
     }
 
     // Vector128`1  ->  Vector128
-    private TypeDef GetVectorExtClass(TypeDesc vectorType) {
+    private TypeDef GetVectorExtClass(TypeDesc realType) {
         return _comp.Resolver.CoreLib.FindType(
-            "System.Runtime.Intrinsics", vectorType.Name[0..^2],
+            "System.Runtime.Intrinsics", realType.Name[0..^2],
             throwIfNotFound: true)!;
     }
 
     
     private VectorPack GetVectorPack(VectorType type) {
+        if (type.ElemType == PrimType.Bool) {
+            type = VectorType.Create(_naturalMaskType, type.Width);
+        }
         return _vectorPackCache.GetOrAddRef(type) ??= new(_comp, type);
     }
     private VectorType GetSourceVectorType(Value value) {
         return (VectorType)_sourceTypes.GetValueOrDefault(value, value.ResultType);
     }
+    private TypeDesc GetSourceElemType(Value value) {
+        var type = _sourceTypes.GetValueOrDefault(value, value.ResultType);
+        return (type as VectorType)?.ElemType ?? type;
+    }
+    private TypeDesc GetLoweredElemType(Value value) {
+        var type = value.ResultType;
+        Debug.Assert(type.Name.StartsWith("Vector"));
+        return type.IsCorelibType() ? type.GenericParams[0] : throw new NotImplementedException();
+    }
+    private VectorType GetLoweredVectorType(Value value) {
+        var type = GetSourceVectorType(value);
+        return VectorType.Create(GetLoweredElemType(value), type.Width);
+    }
+    
     private TypeDesc GetRealType(VectorType type) {
         var pack = GetVectorPack(type);
         return pack.VecTypes!.Length >= 2 ? pack.WrapperType! : pack.VecTypes[0]!;
-    }
-    private bool IsScalarType(TypeDesc type) {
-        return type.Kind != TypeKind.Struct;
     }
 }
 
@@ -318,7 +390,7 @@ class VectorPack {
                 var (genType, vecBits) = (width * laneBits) switch {
                     >= 512 => (typeof(Vector512<>), 512),    
                     >= 256 => (typeof(Vector256<>), 256),
-                    >= 128 => (typeof(Vector128<>), 128),
+                    _ => (typeof(Vector128<>), 128),
                 };
                 packs.Add(comp.Resolver.Import(genType).GetSpec([laneType]));
                 width -= vecBits / laneBits;

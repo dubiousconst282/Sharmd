@@ -59,15 +59,21 @@ var meth = candidateMethods.First(m => m.Name == "<<Main>$>b__0").Body;
 
 IRPrinter.ExportForest(meth, "logs/dump.txt");
 //IRPrinter.ExportDot(meth, "logs/dump.dot", [new UniformValueAnalysis(meth, pm.Compilation.GetAnalysis<GlobalFunctionEffects>())]);
+IRPrinter.ExportDot(meth, "logs/dump.dot", [new PostDominatorTree(meth)]);
 
-var widenPass=new VectorWideningPass(pm.Compilation, 4);
+
+var widenPass = new VectorWideningPass(pm.Compilation, 4);
 widenPass.AddEntryPoint(meth);
 widenPass.Process();
 
-var vectorMeth = widenPass.GetVectorizedMethod(meth);
+var vectorMeth = widenPass.GetVectorizedMethod(meth)!;
+
+new ReconvergeCFG().Run(new MethodTransformContext(pm.Compilation, vectorMeth));
 
 new DeadCodeElim().Run(new MethodTransformContext(pm.Compilation, vectorMeth));
+
 IRPrinter.ExportPlain(vectorMeth, "logs/dump_A.txt");
+IRPrinter.ExportDot(vectorMeth, "logs/dump_A.dot", [new PostDominatorTree(vectorMeth)]);
 
 new VectorLoweringPass(pm.Compilation).Process(vectorMeth);
 IRPrinter.ExportPlain(vectorMeth, "logs/dump_B.txt");
